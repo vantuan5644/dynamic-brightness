@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "vantuan5644.dynamic-brightness",
+  "name": "Dynamic brightness",
+  "version": "0.1.0",
+  "author": "Tuan Tran",
+  "license": "MIT",
+  "description": "Per-monitor content-adaptive brightness: dims a monitor on bright content and restores it on dark content, through wluma.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Dynamic brightness",
+    "description": "Turn dynamic brightness on per monitor and set how strongly it dims bright content",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

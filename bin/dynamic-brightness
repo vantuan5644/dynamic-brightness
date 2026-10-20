@@ -1,0 +1,354 @@
+#!/bin/bash
+# Content-adaptive brightness, per monitor: dim a monitor on bright content and
+# give the brightness back on dark content.
+#
+# On Linux wluma does the measuring and the DDC/backlight writes. This keeps a
+# small per-monitor settings file (on/off + how hard to dim bright content) and
+# turns it into wluma's config.toml, keyed by whatever connector each monitor
+# has right now. The Omarchy shell plugin calls it; it is as usable by hand.
+#
+# Usage:
+#   dynamic-brightness status                 JSON for the panel
+#   dynamic-brightness set <monitor> [on|off] [strength=N]
+#   dynamic-brightness apply                  regenerate wluma config, restart wluma if it changed
+#   dynamic-brightness config                 print the wluma config apply would write
+#
+# <monitor> is a connector (DP-1) or any unique substring of the monitor's
+# description (RTK 0x2775). Settings are stored by description, so they follow
+# a monitor when its connector is renumbered. strength is 0-90: the percentage
+# taken off your brightness on a fully white screen, scaled down linearly for
+# darker content. Black content is never dimmed.
+
+set -euo pipefail
+
+CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}
+SETTINGS=$CONFIG_HOME/dynamic-brightness/settings.json
+STATE_DIR=$STATE_HOME/dynamic-brightness
+# Per monitor: the strength wluma was last started with and the brightness
+# anchor this script last gave it. See "Keeping your brightness" below.
+ANCHORS=$STATE_DIR/anchors.json
+WLUMA_CONFIG=$CONFIG_HOME/wluma/config.toml
+MARKER="# Managed by dynamic-brightness; edits are overwritten."
+DEFAULT_STRENGTH=40
+MAX_STRENGTH=90
+# How long to wait for a restarted wluma to report luma for every monitor.
+READY_TIMEOUT=${DYNAMIC_BRIGHTNESS_READY_TIMEOUT:-20}
+
+die() { printf 'dynamic-brightness: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'dynamic-brightness: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have jq || die "jq is required"
+have hyprctl || die "hyprctl is required (is this a Hyprland session?)"
+
+read_json() {  # read_json <file> <default>
+  if [[ -s $1 ]]; then jq -c '.' "$1" 2>/dev/null || die "$1 is not valid JSON"
+  else printf '%s\n' "$2"; fi
+}
+read_settings() { read_json "$SETTINGS" '{"version":1,"monitors":{}}'; }
+read_anchors() { read_json "$ANCHORS" '{}'; }
+
+write_json() {  # write_json <file>  (stdin: JSON), atomically
+  local dest=$1 tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp=$(mktemp "$dest.XXXXXX")
+  jq '.' >"$tmp" && mv -f "$tmp" "$dest"
+}
+
+# Every monitor Hyprland knows about, disabled ones included: wluma adopts any
+# connected output it is not told to leave alone, so each needs an entry.
+monitors() { hyprctl monitors all -j; }
+
+wluma_ready() { have wluma && wluma status --json >/dev/null 2>&1; }
+wluma_status() { if wluma_ready; then wluma status --json; else echo '{"outputs":[]}'; fi; }
+
+# Monitor list joined with settings and wluma's live readings: the one shape
+# the panel, the generator and apply all work from.
+#
+# key: the settings key. The description (make, model, serial) survives
+# connector renumbering; two identical monitors with no serial would share it,
+# so a description that occurs more than once gets its connector appended.
+joined() {
+  jq -n --argjson mons "$(monitors)" --argjson cfg "$(read_settings)" \
+        --argjson wl "$(wluma_status)" --argjson def "$DEFAULT_STRENGTH" \
+        --argjson max "$MAX_STRENGTH" '
+    # Where each monitor sits in the layout, in words. Vendor strings like
+    # "RTK J560J10" vs "RTK 0x2775" do not tell two panels apart; "top-left"
+    # does. Uses logical size, and only enabled monitors bound the layout.
+    def lw: .width / (.scale // 1);
+    def lh: .height / (.scale // 1);
+    def third($v; $lo; $hi; $names):
+      if $hi - $lo <= 0 then ""
+      else (($v - $lo) / ($hi - $lo)) as $f
+        | if $f < 0.4 then $names[0] elif $f > 0.6 then $names[1] else "" end end;
+    ([$mons[] | select(.disabled | not)]) as $on
+    | ($on | map(.x) | min) as $x0 | ($on | map(.x + lw) | max) as $x1
+    | ($on | map(.y) | min) as $y0 | ($on | map(.y + lh) | max) as $y1
+    | def position:
+        if .disabled or ($on | length) < 2 then ""
+        else [ third(.y + lh / 2; $y0; $y1; ["top", "bottom"]),
+               third(.x + lw / 2; $x0; $x1; ["left", "right"]) ]
+             | map(select(. != "")) | join("-") end;
+      # Hand-edited settings must not be able to break wluma: it rejects the
+      # whole config, for every monitor, on a reduction outside 0-100.
+      def strength: if type == "number" then ([0, (. | round), $max] | sort | .[1]) else $def end;
+      ($mons | map(.description) | group_by(.) | map(select(length > 1) | .[0])) as $dupes
+    | ($mons | map(.serial // "" | select(. != "")) | group_by(.) | map(select(length > 1) | .[0])) as $dupserials
+    | [ $mons[] as $m
+        | (if ($dupes | index($m.description)) then "\($m.description) @\($m.name)" else $m.description end) as $key
+        | ($cfg.monitors[$key] // {}) as $s
+        | ([$wl.outputs[] | select(.name == $m.name)][0] // {}) as $o
+        | ($m.serial // "") as $sn
+        | {
+            key: $key,
+            connector: $m.name,
+            description: $m.description,
+            # "Invalid Vendor Codename - RTK 0x2775 0x20230923" -> "RTK 0x2775"
+            label: ($m.description | sub("^Invalid Vendor Codename - "; "")
+                    | if $sn != "" and endswith(" " + $sn) then .[0:(length - ($sn | length) - 1)] else . end),
+            # Only a serial no other monitor shares can name a DDC display.
+            serial: (if ($dupserials | index($sn)) then "" else $sn end),
+            mode: "\($m.width)x\($m.height)",
+            position: ($m | position),
+            internal: ($m.name | test("^(eDP|LVDS|DSI)-")),
+            # jq: `false // true` is true, so test for false explicitly.
+            active: (($m.disabled | not) and ($m.dpmsStatus != false)),
+            enabled: ($s.enabled == true),
+            strength: ($s.strength | strength),
+            luma: $o.luma,
+            brightness: $o.brightness,
+            state: $o.state
+          } ]'
+}
+
+# wluma finds a DDC display by substring of ddcutil's own listing, whose serial
+# column is lower-case hex while Hyprland reports it upper-case.
+identifier_for() {
+  local serial=$1
+  if [[ $serial =~ ^0[xX][0-9A-Fa-f]+$ ]]; then printf '%s' "${serial,,}"; else printf '%s' "$serial"; fi
+}
+
+generate() {  # generate <joined-json>
+  local mons=$1
+  printf '%s\n' "$MARKER" "# Settings: $SETTINGS" ""
+  # No ambient-light input: the curve is screen content only, so a laptop
+  # sensor cannot quietly change what a strength means.
+  printf '%s\n' "[als.none]" ""
+  # Desktop environments run their own idle dimming; wluma's would stack on it.
+  printf '%s\n' "[idle]" "enabled = false" ""
+  local conn internal enabled strength serial kind ident
+  while IFS=$'\t' read -r conn internal enabled strength serial; do
+    kind=ddcutil; [[ $internal == true ]] && kind=backlight
+    printf '[[output.%s]]\nname = "%s"\n' "$kind" "$conn"
+    if [[ $enabled != true ]]; then
+      printf 'enabled = false\n\n'
+      continue
+    fi
+    # Normally wluma pairs connectors to DDC displays itself. Some it cannot
+    # (an HDMI port whose I2C bus ddcutil cannot map to a DRM connector), and
+    # a unique serial pins those.
+    ident=$(identifier_for "$serial")
+    [[ $kind == ddcutil && -n $ident ]] && printf 'identifier = %s\n' "$(jq -Rn --arg s "$ident" '$s')"
+    # Gamma control is exclusive under Wayland, and a night light (hyprsunset
+    # on Omarchy) needs it.
+    printf 'gamma = false\n\n'
+    printf '[output.%s.predictor.manual]\n' "$kind"
+    printf '[[output.%s.predictor.manual.points]]\nals = 0\nluma = 0\nreduction = 0\n\n' "$kind"
+    printf '[[output.%s.predictor.manual.points]]\nals = 0\nluma = 100\nreduction = %d\n\n' "$kind" "$strength"
+  done < <(jq -r '.[] | [.connector, .internal, .enabled, .strength, .serial] | @tsv' <<<"$mons")
+}
+
+# ---- Keeping your brightness -------------------------------------------------
+#
+# wluma's manual predictor keeps an anchor P, "the brightness on black". It
+# learns it from the last brightness U it was handed (its own startup reading,
+# `wluma set brightness`, or you changing the monitor) at the luma l of that
+# moment: P = U + round(U * r(l)), with r(l) = strength * l / 10000. It shows
+# P - round(U * r(l_now)). A restart re-learns from whatever is on the panel,
+# which is already dimmed, so left alone every restart over bright content
+# lowers P, and switching a monitor on over a white page raises it.
+#
+# So the script owns P. After each restart it hands wluma the brightness
+# T = base / (1 + r) for the current luma, making wluma learn P = base, and
+# records {base, u: T, strength}. Next time, if the panel still shows what that
+# anchor predicts, the recorded base is still true. If not, you changed the
+# brightness yourself since, and wluma learned P from that change at roughly
+# the current content, which is the only fallback that matches wluma.
+
+# base_for <B> <luma> <anchor-json-or-null>: the undimmed brightness now.
+base_for() {
+  jq -n --argjson b "$1" --argjson l "$2" --argjson a "$3" '
+    if $a != null and $a.base != null then
+      ($a.strength * $l / 10000) as $r
+      | ($a.base) as $p
+      | ($a.u + (($a.u * $a.strength * $a.l / 10000) | round)) as $p_real
+      | if (($p_real - (($a.u * $r) | round)) - $b | fabs) <= 1 then $p
+        else ($b + (($b * $r) | round)) end
+    else $b end'
+}
+
+clamp_pct() { jq -n --argjson v "$1" '[1, ($v | round), 100] | sort | .[1]'; }
+
+# Before a restart: hand back every monitor being switched off at its base,
+# and note the base of every monitor staying on. Prints {key: base}.
+pre_restart() {  # pre_restart <old-joined> <new-joined>
+  local old=$1 new=$2 anchors bases='{}' key conn b l en_new base
+  anchors=$(read_anchors)
+  while IFS=$'\t' read -r key conn b l en_new; do
+    base=$(base_for "$b" "$l" "$(jq -c --arg k "$key" '.[$k]' <<<"$anchors")")
+    if [[ $en_new == true ]]; then
+      bases=$(jq -c --arg k "$key" --argjson v "$base" '.[$k] = $v' <<<"$bases")
+    else
+      wluma set brightness "$conn" "$(clamp_pct "$base")%" >/dev/null 2>&1 ||
+        warn "could not restore $conn to $base%"
+    fi
+  done < <(jq -r --argjson new "$new" '
+    .[] | select(.enabled and .luma != null and .brightness != null) | . as $m
+    | ([$new[] | select(.key == $m.key)][0].enabled // false) as $on
+    | [.key, .connector, .brightness, .luma, $on] | @tsv' <<<"$old")
+  printf '%s\n' "$bases"
+}
+
+# After a restart: wait for wluma to measure each enabled monitor, then anchor
+# it. A monitor with no recorded base (just switched on, or wluma just started)
+# takes the brightness it had as its base: what you had set stays yours.
+post_restart() {  # post_restart <bases-json>
+  local bases=$1 deadline status pending anchors='{}' key conn b l s base r t
+  deadline=$((SECONDS + READY_TIMEOUT))
+  while :; do
+    status=$(joined)
+    pending=$(jq '[.[] | select(.enabled and .active and (.luma == null or .brightness == null))] | length' <<<"$status")
+    (( pending == 0 )) && break
+    (( SECONDS >= deadline )) && { warn "wluma did not report every monitor within ${READY_TIMEOUT}s"; break; }
+    sleep 1
+  done
+  while IFS=$'\t' read -r key conn b l s; do
+    base=$(jq -r --arg k "$key" --argjson b "$b" '.[$k] // $b' <<<"$bases")
+    r=$(jq -n --argjson s "$s" --argjson l "$l" '$s * $l / 10000')
+    t=$(clamp_pct "$(jq -n --argjson base "$base" --argjson r "$r" '$base / (1 + $r)')")
+    wluma set brightness "$conn" "$t%" >/dev/null 2>&1 || warn "could not anchor $conn"
+    anchors=$(jq -c --arg k "$key" --argjson base "$base" --argjson t "$t" --argjson s "$s" --argjson l "$l" \
+      '.[$k] = {base: $base, u: $t, strength: $s, l: $l}' <<<"$anchors")
+  done < <(jq -r '.[] | select(.enabled and .luma != null and .brightness != null)
+                  | [.key, .connector, .brightness, .luma, .strength] | @tsv' <<<"$status")
+  printf '%s' "$anchors" | write_json "$ANCHORS"
+}
+
+apply() {
+  local before new old bases='{}' any
+  before=$(joined)
+  new=$(generate "$before")
+  old=$( [[ -f $WLUMA_CONFIG ]] && cat "$WLUMA_CONFIG" || true)
+  any=$(jq 'any(.enabled)' <<<"$before")
+
+  if [[ $new == "$old" ]]; then
+    # Config already matches; only make sure the daemon is up if it should be.
+    if [[ $any == true ]] && have wluma && ! systemctl --user is-active --quiet wluma.service; then
+      systemctl --user enable --now wluma.service >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+
+  # Someone else's wluma config: keep a copy rather than silently replace it.
+  if [[ -n $old && $old != "$MARKER"* ]]; then
+    cp "$WLUMA_CONFIG" "$WLUMA_CONFIG.bak.$(date +%s)"
+    warn "backed up existing $WLUMA_CONFIG"
+  fi
+
+  # The previous config's view of which monitors were on: this run's settings
+  # are already the new ones, so rebuild "before" from the anchors' strengths.
+  if have wluma && wluma_ready; then
+    local was_on
+    was_on=$(read_anchors)
+    bases=$(pre_restart "$(jq -c --argjson a "$was_on" \
+      'map(.enabled = ($a[.key] != null) | .strength = ($a[.key].strength // .strength))' <<<"$before")" "$before")
+  fi
+
+  mkdir -p "$(dirname "$WLUMA_CONFIG")"
+  printf '%s' "$new" >"$WLUMA_CONFIG.tmp" && mv -f "$WLUMA_CONFIG.tmp" "$WLUMA_CONFIG"
+
+  have wluma || { warn "wluma is not installed (yay -S wluma)"; return 0; }
+  if [[ $any != true ]]; then
+    systemctl --user disable --now wluma.service >/dev/null 2>&1 || true
+    printf '{}' | write_json "$ANCHORS"
+    return 0
+  fi
+  systemctl --user enable wluma.service >/dev/null 2>&1 || true
+  systemctl --user restart wluma.service
+
+  # wluma needs a few seconds of DDC probing before it measures anything. Do
+  # the anchoring in the background so the panel is not blocked, still holding
+  # the lock (inherited fd) so the next set waits for it.
+  # setsid: the panel's process group can be torn down when this returns.
+  if [[ ${DYNAMIC_BRIGHTNESS_FOREGROUND:-0} == 1 ]]; then
+    post_restart "$bases"
+  else
+    setsid -f "$0" _post_restart "$bases" </dev/null >>"$STATE_DIR/anchor.log" 2>&1
+  fi
+}
+
+status() {
+  local installed=false running=false ready=false
+  have wluma && installed=true
+  # running = systemd has the service up; ready = its IPC answers. A restart
+  # takes a few seconds of DDC probing before IPC comes back, and the panel
+  # says "applying" for that window instead of claiming wluma is down.
+  systemctl --user is-active --quiet wluma.service 2>/dev/null && running=true
+  wluma_ready && ready=true running=true
+  jq -n --argjson mons "$(joined)" --argjson installed "$installed" --argjson running "$running" \
+        --argjson ready "$ready" --argjson max "$MAX_STRENGTH" \
+    '{wluma: {installed: $installed, running: $running, ready: $ready}, maxStrength: $max, monitors: $mons}'
+}
+
+set_monitor() {
+  local query=${1:-}; shift || true
+  [[ -n $query ]] || die "set needs a monitor (connector or description substring)"
+  local key
+  # An exact connector name wins; a description substring must be unique.
+  key=$(joined | jq -r --arg q "$query" '
+    ([.[] | select(.connector == $q)] | if length == 1 then .[0].key else empty end)
+    // ([.[] | select(.description | contains($q))]
+        | if length == 1 then .[0].key elif length == 0 then "" else "AMBIGUOUS" end)')
+  [[ -n $key ]] || die "no monitor matches '$query'"
+  [[ $key != AMBIGUOUS ]] || die "'$query' matches more than one monitor; be more specific"
+
+  local patch='{}' arg n
+  for arg in "$@"; do
+    case $arg in
+      on|true)   patch=$(jq -c '.enabled = true' <<<"$patch") ;;
+      off|false) patch=$(jq -c '.enabled = false' <<<"$patch") ;;
+      strength=*)
+        n=${arg#strength=}
+        [[ $n =~ ^[0-9]+$ ]] || die "strength must be a whole number, got '$n'"
+        (( 10#$n <= MAX_STRENGTH )) || die "strength must be 0-$MAX_STRENGTH"
+        patch=$(jq -c --argjson n "$((10#$n))" '.strength = $n' <<<"$patch") ;;
+      *) die "unknown setting '$arg' (on, off, strength=N)" ;;
+    esac
+  done
+
+  read_settings | jq --arg k "$key" --argjson p "$patch" \
+    '.version = 1 | .monitors[$k] = ((.monitors[$k] // {}) + $p)' | write_json "$SETTINGS"
+  apply
+}
+
+# set and apply read, modify and rewrite the settings and the wluma config.
+# The panel, the hotplug service and a terminal can all fire at once, and
+# without this the slower writer silently drops the other's change.
+lock() {
+  mkdir -p "$STATE_DIR"
+  exec {LOCK_FD}>"$STATE_DIR/lock"
+  flock "$LOCK_FD"
+}
+
+case ${1:-} in
+  status) status ;;
+  set)    shift; lock; set_monitor "$@" ;;
+  apply)  lock; apply ;;
+  config) generate "$(joined)" ;;
+  # Internal: apply's detached second half. Runs under apply's lock, which it
+  # inherits as an open fd, so it must not take the lock again.
+  _post_restart) post_restart "${2:-"{}"}" ;;
+  -h|--help|help|"") sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (try --help)" ;;
+esac

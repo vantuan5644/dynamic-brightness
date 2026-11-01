@@ -98,11 +98,36 @@ jq -e '.monitors["Invalid Vendor Codename - RTK 0x2775 0x20230923"] == {"enabled
 block=$(awk '/^name = "DP-1"/{f=1} f&&/^\[\[output\.(ddcutil|backlight)\]\]/{exit} f{print}' "$WCONF")
 grep -q 'identifier = "0x20230923"' <<<"$block" && ok "DDC identifier is the lower-case serial" || fail "identifier" "$block"
 grep -q 'gamma = false' <<<"$block" && ok "gamma left to the night light" || fail "gamma" "$block"
-grep -A3 'luma = 100' <<<"$block" | grep -q 'reduction = 50' && ok "white reduction = strength" || fail "reduction" "$block"
+grep -q 'luma = 100, reduction = 50 }' <<<"$block" && ok "white reduction = strength" || fail "reduction" "$block"
 grep -q 'restart wluma.service' "$T/systemctl.log" && ok "wluma restarted" || fail "restart" "$(cat "$T/systemctl.log")"
 : >"$T/systemctl.log"; touch "$T/wluma-active"
 run apply
 [[ ! -s $T/systemctl.log ]] && ok "unchanged config leaves a running wluma alone" || fail "idempotent apply" "$(cat "$T/systemctl.log")"
+teardown
+
+echo "the curve is linear in wluma, not just on paper"
+setup
+run set DP-1 on strength=45
+# wluma weights points by inverse distance squared, so the two end points
+# alone make an S-curve (at 45: 22.5% off at half white is right, 2.6% at 20%
+# white is not 9%). With a point at every whole luma it returns that point.
+pts=$(awk '/^name = "DP-1"/{f=1} f&&/^\[\[output\.(ddcutil|backlight)\]\]/{exit} f' "$WCONF" |
+  sed -nE 's/^  \{ als = 0, luma = ([0-9]+), reduction = ([0-9]+) \},$/\1 \2/p')
+[[ $(wc -l <<<"$pts") == 101 && $(cut -d' ' -f1 <<<"$pts" | tr '\n' ' ') == "$(seq -s ' ' 0 100) " ]] &&
+  ok "a point at every luma 0-100" || fail "point lumas" "$pts"
+want=$(for l in $(seq 0 100); do jq -n --argjson l "$l" '"\($l) \(45 * $l / 100 | round)"' -r; done)
+[[ $pts == "$want" ]] && ok "each point takes off strength * luma / 100 (half white: 23%)" ||
+  fail "point reductions" "$(diff <(echo "$want") <(echo "$pts"))"
+if command -v python3 >/dev/null && python3 -c 'import tomllib' 2>/dev/null; then
+  python3 -c '
+import sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+o = [o for o in c["output"]["ddcutil"] if o["name"] == "DP-1"][0]
+p = o["predictor"]["manual"]["points"]
+assert len(p) == 101 and all(set(x) == {"als", "luma", "reduction"} for x in p)
+assert all(isinstance(v, int) and v >= 0 for x in p for v in x.values())
+' "$WCONF" 2>"$T/py" && ok "config parses as TOML into wluma's point shape" || fail "toml" "$(cat "$T/py")"
+fi
 teardown
 
 echo "monitor lookup"
@@ -180,6 +205,18 @@ run set DP-1 off
 teardown
 
 setup
+wluma_shows DP-1 0 60
+run set DP-1 on strength=70
+wluma_shows DP-1 100 45
+: >"$T/wluma.log"
+run set DP-1 off
+# wluma multiplies before dividing: 45 * 70 / 100 = 31.5 rounds to 32, so it
+# learned 77. 45 * (70 / 100) is 31.4999... in floating point and gives 76.
+[[ $(last_set) == "set brightness DP-1 77%" ]] && ok "rounding ties go the way wluma's do" ||
+  fail "rounding tie" "$(cat "$T/wluma.log")"
+teardown
+
+setup
 wluma_shows DP-1 0 95
 run set DP-1 on strength=10
 wluma_shows DP-1 0 95
@@ -192,6 +229,45 @@ run set DP-1 off
 [[ $(last_set) == "set brightness DP-1 100%" ]] && ok "restores are clamped to 100" || fail "clamp" "$(cat "$T/wluma.log")"
 teardown
 
+setup
+# Half-way content: the anchor must use the same rounded point wluma reads
+# from the config, 19% at luma 37 and strength 50 (not 18.5%).
+wluma_shows DP-1 37 40
+run set DP-1 on strength=50
+r=$(sed -nE 's/^  \{ als = 0, luma = 37, reduction = ([0-9]+) \},$/\1/p' "$WCONF")
+t=$(last_set | sed -E 's/.* ([0-9]+)%$/\1/')
+[[ $r == 19 && $t == 34 && $((t + (t * r + 50) / 100)) == 40 ]] &&
+  ok "mid-grey: wluma is handed 34, which it learns back as 40" || fail "mid-grey anchor" "r=$r t=$t"
+jq -e '.["Invalid Vendor Codename - RTK 0x2775 0x20230923"].curve == "linear"' "$XDG_STATE_HOME/dynamic-brightness/anchors.json" >/dev/null &&
+  ok "anchors record which curve wluma had" || fail "curve tag" "$(cat "$XDG_STATE_HOME/dynamic-brightness/anchors.json")"
+teardown
+
+# Anchors written while wluma had only the two end points carry no curve, and
+# what wluma learned then followed its S-curve. Base 44 anchored at luma 18
+# meant wluma learned 39 + round(39 * 3.2%) = 40; on luma 60 (48.5% off under
+# that curve) it shows 40 - 19 = 21. Read with the linear curve, 21 would look
+# like a manual change and the base would come back as 30.
+legacy() {  # legacy <luma> <brightness>
+  mkdir -p "$(dirname "$SETTINGS")" "$XDG_STATE_HOME/dynamic-brightness"
+  echo '{"version":1,"monitors":{"Invalid Vendor Codename - RTK 0x2775 0x20230923":{"enabled":true,"strength":70}}}' >"$SETTINGS"
+  echo '{"Invalid Vendor Codename - RTK 0x2775 0x20230923":{"base":44,"u":39,"strength":70,"l":18}}' \
+    >"$XDG_STATE_HOME/dynamic-brightness/anchors.json"
+  wluma_shows DP-1 "$1" "$2"
+}
+setup
+legacy 60 21
+run set DP-1 off
+[[ $(last_set) == "set brightness DP-1 44%" ]] && ok "an anchor from the two-point curve is read with that curve" ||
+  fail "legacy anchor" "$(cat "$T/wluma.log")"
+teardown
+setup
+legacy 60 30
+run set DP-1 off
+# You turned it up to 30 under the old curve: wluma learned 30 + round(30 * 48.5%) = 45.
+[[ $(last_set) == "set brightness DP-1 45%" ]] && ok "a manual change under the two-point curve is too" ||
+  fail "legacy manual change" "$(cat "$T/wluma.log")"
+teardown
+
 echo "settings that must not break wluma"
 setup
 mkdir -p "$(dirname "$SETTINGS")"
@@ -199,7 +275,7 @@ echo '{"version":1,"monitors":{"LG Electronics LG HDR 4K 0x00044DDB":{"enabled":
   "Invalid Vendor Codename - RTK J560J10 0x20240308":{"enabled":true,"strength":"lots"}}}' >"$SETTINGS"
 cfg=$(run config)
 grep -q 'reduction = 250' <<<"$cfg" && fail "strength 250 passed through" "$cfg" || ok "hand-edited strength clamped to 90"
-[[ $(grep -c 'reduction = 90' <<<"$cfg") == 1 && $(grep -c 'reduction = 40' <<<"$cfg") == 1 ]] &&
+[[ $(grep -c 'luma = 100, reduction = 90 }' <<<"$cfg") == 1 && $(grep -c 'luma = 100, reduction = 40 }' <<<"$cfg") == 1 ]] &&
   ok "non-numeric strength falls back to the default" || fail "fallback" "$cfg"
 teardown
 

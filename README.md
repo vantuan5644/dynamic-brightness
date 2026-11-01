@@ -93,9 +93,17 @@ The same settings are available from a terminal:
   keyed by connector name, so the plugin's service regenerates the file on every
   monitor add/remove and restarts `wluma.service` when it changes. If a config
   the plugin did not write is there, it is backed up first.
-- Each enabled monitor gets wluma's `manual` predictor: no reduction at black,
-  `strength`% at white. Monitors you have not switched on get `enabled = false`,
-  so wluma does not adopt them in its learning mode.
+- Each enabled monitor gets wluma's `manual` predictor with a point at every
+  luma from 0 to 100: no reduction at black, `strength`% at white, and the
+  straight line between them rounded to whole percents. Two end points would
+  be enough on paper, but wluma blends points by inverse distance squared,
+  which turns two points into an S-curve: at strength 70 it took 4% off at 20%
+  white and 48% at 60%, so mid-grey content swung brightness about twice as
+  hard as the line. wluma uses a point as is when the luma matches it exactly,
+  and luma is always a whole percent, so with a point at every luma it follows
+  the line exactly.
+- Monitors you have not switched on get `enabled = false`, so wluma does not
+  adopt them in its learning mode.
 - wluma's gamma control is turned off for every monitor, because Wayland gamma
   is exclusive and Omarchy's night light (hyprsunset) needs it. wluma's own idle
   dimming is off too, since Omarchy has its own screensaver and lock.
@@ -117,8 +125,12 @@ is switched on, the brightness it has then becomes its setting.
 ## Caveats
 
 - DDC/CI is slow (about a quarter of a second per write) and some monitors
-  store brightness in non-volatile memory on every write. wluma ramps changes,
-  so expect many small writes when content changes a lot.
+  store brightness in non-volatile memory on every write. wluma moves toward
+  a new brightness in steps of a quarter of the distance, 50 ms apart plus the
+  DDC time, so a jump from a dark window to a white page shows as a few quick
+  steps rather than a fade. The last step can land a few points past the
+  target, which a later adjustment takes back. That timing is built into wluma
+  and has no config setting.
 - wluma's raw DDC access sometimes fails to read a monitor once and then
   recovers. Installing [ddcutil-service](https://github.com/digitaltrails/ddcutil-service)
   (`yay -S ddcutil-service`) makes it more reliable.

@@ -35,6 +35,25 @@ MAX_STRENGTH=90
 # How long to wait for a restarted wluma to report luma for every monitor.
 READY_TIMEOUT=${DYNAMIC_BRIGHTNESS_READY_TIMEOUT:-20}
 
+# The dimming curve, as the percent taken off at luma $l (0-100). The config
+# and the anchor math below must agree on it exactly, so both use these.
+#
+# wluma's manual predictor weights its points by inverse distance squared,
+# which bends two end points into an S: at strength 70, 4% off at luma 20 and
+# 48% at 60, so mid-grey content swung brightness twice as hard as the linear
+# curve promises. Luma is a whole percent and wluma returns a point's own value
+# when luma lands on it, so the config has a point at every luma, rounded to
+# the whole percent wluma stores.
+#
+# Anchors from before that (no "curve") were made under the S-curve, and
+# reading them back needs the same formula wluma used then.
+# shellcheck disable=SC2016  # jq variables, not shell ones
+CURVE='
+  def reduction($s; $l): $s * $l / 100 | round;
+  def reduction_for($a; $l):
+    if $a.curve == "linear" then reduction($a.strength; $l)
+    else ($l * $l) as $x | ((100 - $l) * (100 - $l)) as $y | $a.strength * $x / ($x + $y) end;'
+
 die() { printf 'dynamic-brightness: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'dynamic-brightness: %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -154,8 +173,8 @@ generate() {  # generate <joined-json>
     # on Omarchy) needs it.
     printf 'gamma = false\n\n'
     printf '[output.%s.predictor.manual]\n' "$kind"
-    printf '[[output.%s.predictor.manual.points]]\nals = 0\nluma = 0\nreduction = 0\n\n' "$kind"
-    printf '[[output.%s.predictor.manual.points]]\nals = 0\nluma = 100\nreduction = %d\n\n' "$kind" "$strength"
+    jq -rn --argjson s "$strength" "$CURVE"'
+      "points = [", (range(0; 101) | "  { als = 0, luma = \(.), reduction = \(reduction($s; .)) },"), "]", ""'
   done < <(jq -r '.[] | [.connector, .internal, .enabled, .strength, .serial] | @tsv' <<<"$mons")
 }
 
@@ -164,8 +183,8 @@ generate() {  # generate <joined-json>
 # wluma's manual predictor keeps an anchor P, "the brightness on black". It
 # learns it from the last brightness U it was handed (its own startup reading,
 # `wluma set brightness`, or you changing the monitor) at the luma l of that
-# moment: P = U + round(U * r(l)), with r(l) = strength * l / 10000. It shows
-# P - round(U * r(l_now)). A restart re-learns from whatever is on the panel,
+# moment: P = U + round(U * r(l)), with r(l) the curve's reduction / 100. It
+# shows P - round(U * r(l_now)). A restart re-learns from whatever is on the panel,
 # which is already dimmed, so left alone every restart over bright content
 # lowers P, and switching a monitor on over a white page raises it.
 #
@@ -178,13 +197,16 @@ generate() {  # generate <joined-json>
 
 # base_for <B> <luma> <anchor-json-or-null>: the undimmed brightness now.
 base_for() {
-  jq -n --argjson b "$1" --argjson l "$2" --argjson a "$3" '
+  jq -n --argjson b "$1" --argjson l "$2" --argjson a "$3" "$CURVE"'
+    # Multiply before dividing, as wluma does: 45 * (70 / 100) is 31.4999...
+    # and would round the other way on a tie.
+    def off($v; $red): $v * $red / 100 | round;
     if $a != null and $a.base != null then
-      ($a.strength * $l / 10000) as $r
+      reduction_for($a; $l) as $red
       | ($a.base) as $p
-      | ($a.u + (($a.u * $a.strength * $a.l / 10000) | round)) as $p_real
-      | if (($p_real - (($a.u * $r) | round)) - $b | fabs) <= 1 then $p
-        else ($b + (($b * $r) | round)) end
+      | ($a.u + off($a.u; reduction_for($a; $a.l))) as $p_real
+      | if (($p_real - off($a.u; $red)) - $b | fabs) <= 1 then $p
+        else ($b + off($b; $red)) end
     else $b end'
 }
 
@@ -225,11 +247,11 @@ post_restart() {  # post_restart <bases-json>
   done
   while IFS=$'\t' read -r key conn b l s; do
     base=$(jq -r --arg k "$key" --argjson b "$b" '.[$k] // $b' <<<"$bases")
-    r=$(jq -n --argjson s "$s" --argjson l "$l" '$s * $l / 10000')
+    r=$(jq -n --argjson s "$s" --argjson l "$l" "$CURVE"' reduction($s; $l) / 100')
     t=$(clamp_pct "$(jq -n --argjson base "$base" --argjson r "$r" '$base / (1 + $r)')")
     wluma set brightness "$conn" "$t%" >/dev/null 2>&1 || warn "could not anchor $conn"
     anchors=$(jq -c --arg k "$key" --argjson base "$base" --argjson t "$t" --argjson s "$s" --argjson l "$l" \
-      '.[$k] = {base: $base, u: $t, strength: $s, l: $l}' <<<"$anchors")
+      '.[$k] = {base: $base, u: $t, strength: $s, l: $l, curve: "linear"}' <<<"$anchors")
   done < <(jq -r '.[] | select(.enabled and .luma != null and .brightness != null)
                   | [.key, .connector, .brightness, .luma, .strength] | @tsv' <<<"$status")
   printf '%s' "$anchors" | write_json "$ANCHORS"

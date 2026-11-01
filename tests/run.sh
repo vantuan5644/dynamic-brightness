@@ -98,11 +98,28 @@ jq -e '.monitors["Invalid Vendor Codename - RTK 0x2775 0x20230923"] == {"enabled
 block=$(awk '/^name = "DP-1"/{f=1} f&&/^\[\[output\.(ddcutil|backlight)\]\]/{exit} f{print}' "$WCONF")
 grep -q 'identifier = "0x20230923"' <<<"$block" && ok "DDC identifier is the lower-case serial" || fail "identifier" "$block"
 grep -q 'gamma = false' <<<"$block" && ok "gamma left to the night light" || fail "gamma" "$block"
+grep -q '^transition_ms = 4000$' <<<"$block" && ok "changes fade over four seconds" || fail "transition" "$block"
+[[ $(grep -c 'transition_ms' "$WCONF") == 1 ]] && ok "only enabled monitors get a fade" || fail "transition count" "$(cat "$WCONF")"
 grep -q 'luma = 100, reduction = 50 }' <<<"$block" && ok "white reduction = strength" || fail "reduction" "$block"
 grep -q 'restart wluma.service' "$T/systemctl.log" && ok "wluma restarted" || fail "restart" "$(cat "$T/systemctl.log")"
 : >"$T/systemctl.log"; touch "$T/wluma-active"
 run apply
 [[ ! -s $T/systemctl.log ]] && ok "unchanged config leaves a running wluma alone" || fail "idempotent apply" "$(cat "$T/systemctl.log")"
+teardown
+
+echo "restart keeps your brightness"
+setup
+wluma_shows DP-1 0 40
+run set DP-1 on strength=50
+# A white page is up (40 dimmed to 20) when wluma is restarted, say for a new
+# wluma binary. A bare restart would learn 20 as the brightness on black.
+wluma_shows DP-1 100 20
+: >"$T/systemctl.log"; : >"$T/wluma.log"
+run restart || fail "restart exited non-zero" "$(cat "$T/stderr")"
+grep -q 'restart wluma.service' "$T/systemctl.log" && ok "restarts wluma with the config unchanged" ||
+  fail "restart" "$(cat "$T/systemctl.log")"
+[[ $(last_set) == "set brightness DP-1 27%" ]] && ok "and re-anchors base 40 on white (40 / 1.5 = 27)" ||
+  fail "restart anchor" "$(cat "$T/wluma.log")"
 teardown
 
 echo "the curve is linear in wluma, not just on paper"

@@ -11,6 +11,7 @@
 #   dynamic-brightness status                 JSON for the panel
 #   dynamic-brightness set <monitor> [on|off] [strength=N]
 #   dynamic-brightness apply                  regenerate wluma config, restart wluma if it changed
+#   dynamic-brightness restart                restart wluma (e.g. a new binary), keeping your brightness
 #   dynamic-brightness config                 print the wluma config apply would write
 #
 # <monitor> is a connector (DP-1) or any unique substring of the monitor's
@@ -32,6 +33,7 @@ WLUMA_CONFIG=$CONFIG_HOME/wluma/config.toml
 MARKER="# Managed by dynamic-brightness; edits are overwritten."
 DEFAULT_STRENGTH=40
 MAX_STRENGTH=90
+TRANSITION_MS=4000
 # How long to wait for a restarted wluma to report luma for every monitor.
 READY_TIMEOUT=${DYNAMIC_BRIGHTNESS_READY_TIMEOUT:-20}
 
@@ -171,7 +173,13 @@ generate() {  # generate <joined-json>
     [[ $kind == ddcutil && -n $ident ]] && printf 'identifier = %s\n' "$(jq -Rn --arg s "$ident" '$s')"
     # Gamma control is exclusive under Wayland, and a night light (hyprsunset
     # on Omarchy) needs it.
-    printf 'gamma = false\n\n'
+    printf 'gamma = false\n'
+    # How long a brightness change takes, in real time. By default wluma makes
+    # it in four DDC writes however long they take (most of a second each on
+    # some monitors), so a white page arrives as a few visible jumps. With
+    # this it sizes its steps to the display's measured speed. wluma releases
+    # before transition_ms existed ignore the key.
+    printf 'transition_ms = %d\n\n' "$TRANSITION_MS"
     printf '[output.%s.predictor.manual]\n' "$kind"
     jq -rn --argjson s "$strength" "$CURVE"'
       "points = [", (range(0; 101) | "  { als = 0, luma = \(.), reduction = \(reduction($s; .)) },"), "]", ""'
@@ -257,14 +265,14 @@ post_restart() {  # post_restart <bases-json>
   printf '%s' "$anchors" | write_json "$ANCHORS"
 }
 
-apply() {
+apply() {  # apply [restart]: restart even when the config is unchanged
   local before new old bases='{}' any
   before=$(joined)
   new=$(generate "$before")
   old=$( [[ -f $WLUMA_CONFIG ]] && cat "$WLUMA_CONFIG" || true)
   any=$(jq 'any(.enabled)' <<<"$before")
 
-  if [[ $new == "$old" ]]; then
+  if [[ $new == "$old" && ${1:-} != restart ]]; then
     # Config already matches; only make sure the daemon is up if it should be.
     if [[ $any == true ]] && have wluma && ! systemctl --user is-active --quiet wluma.service; then
       systemctl --user enable --now wluma.service >/dev/null 2>&1 || true
@@ -367,10 +375,11 @@ case ${1:-} in
   status) status ;;
   set)    shift; lock; set_monitor "$@" ;;
   apply)  lock; apply ;;
+  restart) lock; apply restart ;;
   config) generate "$(joined)" ;;
   # Internal: apply's detached second half. Runs under apply's lock, which it
   # inherits as an open fd, so it must not take the lock again.
   _post_restart) post_restart "${2:-"{}"}" ;;
-  -h|--help|help|"") sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help|"") sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$1' (try --help)" ;;
 esac

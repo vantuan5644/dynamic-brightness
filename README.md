@@ -63,7 +63,11 @@ The same settings are available from a terminal:
 ~/.config/omarchy/plugins/vantuan5644.dynamic-brightness/bin/dynamic-brightness status
 .../bin/dynamic-brightness set DP-1 on strength=40   # connector or part of the name
 .../bin/dynamic-brightness set "LG HDR" off
+.../bin/dynamic-brightness restart                   # e.g. after updating wluma
 ```
+
+Restart wluma with `restart` rather than `systemctl --user restart wluma`; see
+"How it works" for why.
 
 ## Settings
 
@@ -109,6 +113,16 @@ The same settings are available from a terminal:
   dimming is off too, since Omarchy has its own screensaver and lock.
 - No ambient light sensor is used, even on laptops that have one, so a Dynamic
   value always means the same thing.
+- Each enabled monitor gets `transition_ms = 4000`: a brightness change takes
+  up to about four seconds, in as many steps as the monitor can take in that
+  time. Released wluma ignores the key, makes every change in at most four
+  steps however long the monitor takes for them, and can overshoot the last
+  one. A `transition_ms` option and the overshoot fix are proposed upstream
+  ([max-baz/wluma#189](https://github.com/max-baz/wluma/pull/189) and
+  [#188](https://github.com/max-baz/wluma/pull/188)); until a release has
+  them, build wluma from the
+  [`transition-time` branch](https://github.com/vantuan5644/wluma/tree/transition-time)
+  to get the fade.
 
 wluma's manual mode remembers your brightness as "the brightness on black",
 learned from the last brightness it was handed and the content at that moment.
@@ -124,16 +138,15 @@ is switched on, the brightness it has then becomes its setting.
 
 ## Caveats
 
-- DDC/CI is slow (about a quarter of a second per write) and some monitors
-  store brightness in non-volatile memory on every write. wluma moves toward
-  a new brightness in steps of a quarter of the distance, 50 ms apart plus the
-  DDC time, so a jump from a dark window to a white page shows as a few quick
-  steps rather than a fade. The last step can land a few points past the
-  target, which a later adjustment takes back. That timing is built into wluma
-  and has no config setting.
+- DDC/CI is slow, and some monitors store brightness in non-volatile memory
+  on every write. Each wluma step is a DDC read and a write; on one mini-LED
+  panel over raw DDC that took 0.8 s, so a four-second fade there is about
+  five steps. A faster DDC path would give more, smaller steps in the same
+  time.
 - wluma's raw DDC access sometimes fails to read a monitor once and then
   recovers. Installing [ddcutil-service](https://github.com/digitaltrails/ddcutil-service)
-  (`yay -S ddcutil-service`) makes it more reliable.
+  (`yay -S ddcutil-service`) makes it more reliable, and wluma uses it
+  automatically when it is there.
 - Brightness only goes down from your setting. Nothing brightens dark content
   beyond it; set your brightness for dark content.
 - Monitors with local dimming or "dynamic contrast" turned on in their OSD do
